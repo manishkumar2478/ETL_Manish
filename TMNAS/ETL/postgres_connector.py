@@ -38,10 +38,11 @@ if __name__ == "__main__":
     conn = create_connection(
         host="localhost",
         port="5432",
-        database="your_database",
-        user="your_username",
-        password="your_password",
+        database="BSENSE",
+        user="postgres",
+        password="Admin@123",
     )
+
 
     if conn:
         # Example: list all tables

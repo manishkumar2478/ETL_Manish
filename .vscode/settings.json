@@ -1,0 +1,10 @@
+{
+    "python.languageServer": "None",
+    "python-envs.pythonProjects": [
+        {
+            "path": "TMNAS/ETL",
+            "envManager": "ms-python.python:venv",
+            "packageManager": "ms-python.python:pip"
+        }
+    ]
+}
