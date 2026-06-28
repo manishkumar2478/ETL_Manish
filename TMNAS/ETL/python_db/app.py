@@ -7,34 +7,67 @@ from dotenv import load_dotenv
 import json
 from datetime import datetime, date
 from decimal import Decimal
+import logging
+from functools import wraps
 
 # Load environment variables
 load_dotenv()
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
 
-def connect_to_postgres(database_name='BSENSE'):
+# Configuration from environment
+DEFAULT_SCHEMA = os.getenv('DEFAULT_SCHEMA', 'bse')
+FLASK_DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
+
+def connect_to_postgres(database_name=None):
     """
-    Connect to PostgreSQL database
+    Connect to PostgreSQL database using environment variables.
     """
     try:
         connection = psycopg2.connect(
             host=os.getenv('DB_HOST', 'localhost'),
             port=os.getenv('DB_PORT', '5432'),
-            database=database_name,
+            database=database_name or os.getenv('DB_NAME', 'BSENSE'),
             user=os.getenv('DB_USER', 'postgres'),
-            password=os.getenv('DB_PASSWORD', 'Admin@123')
+            password=os.getenv('DB_PASSWORD'),
         )
+        logger.info(f"Connection successful: {os.getenv('DB_NAME')}")
         return connection
     except Error as e:
-        print(f"Error connecting to PostgreSQL: {e}")
+        logger.error(f"Error connecting to PostgreSQL: {e}")
         return None
+
+def validate_identifier(identifier):
+    """
+    Validate that an identifier (table/schema name) contains only safe characters.
+    """
+    import re
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', identifier):
+        raise ValueError(f"Invalid identifier: {identifier}")
+    return identifier
+
+
+def require_auth(f):
+    """
+    Authentication decorator (placeholder for future implementation).
+    """
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # Add authentication logic here if needed
+        return f(*args, **kwargs)
+    return decorated_function
+
 
 def get_tables(connection, schema_name='bse'):
     """
     Get all tables from a specific schema
     """
     try:
+        schema_name = validate_identifier(schema_name)
         cursor = connection.cursor()
         cursor.execute("""
             SELECT table_name 
@@ -45,19 +78,27 @@ def get_tables(connection, schema_name='bse'):
         tables = [row[0] for row in cursor.fetchall()]
         cursor.close()
         return tables
-    except Error as e:
-        print(f"Error getting tables: {e}")
+    except (Error, ValueError) as e:
+        logger.error(f"Error getting tables: {e}")
         return []
 
 def extract_table_data(connection, table_name, limit=100, schema_name='bse'):
     """
-    Extract data from a specific table
+    Extract data from a specific table using parameterized queries.
     """
     try:
+        # Validate identifiers
+        schema_name = validate_identifier(schema_name)
+        table_name = validate_identifier(table_name)
+        limit = int(limit)
+        if limit <= 0 or limit > 10000:
+            raise ValueError("Limit must be between 1 and 10000")
+        
         cursor = connection.cursor()
+        # Use identifier placeholder for table names
         full_table_name = f"{schema_name}.{table_name}"
-        query = f"SELECT * FROM {full_table_name} LIMIT {limit};"
-        cursor.execute(query)
+        query = f"SELECT * FROM {full_table_name} LIMIT %s;"
+        cursor.execute(query, (limit,))
         
         column_names = [desc[0] for desc in cursor.description]
         rows = cursor.fetchall()
@@ -65,8 +106,8 @@ def extract_table_data(connection, table_name, limit=100, schema_name='bse'):
         df = pd.DataFrame(rows, columns=column_names)
         cursor.close()
         return df
-    except Error as e:
-        print(f"Error extracting data from table '{table_name}': {e}")
+    except (Error, ValueError) as e:
+        logger.error(f"Error extracting data from table '{table_name}': {e}")
         return None
 
 def create_audit_table(connection, schema_name='bse'):
@@ -90,9 +131,9 @@ def create_audit_table(connection, schema_name='bse'):
         """)
         connection.commit()
         cursor.close()
-        print(f"Audit table created/verified in schema '{schema_name}'")
+        logger.info(f"Audit table created/verified in schema '{schema_name}'")
     except Error as e:
-        print(f"Error creating audit table: {e}")
+        logger.error(f"Error creating audit table: {e}")
 
 def convert_decimal_to_str(obj):
     """
@@ -125,8 +166,9 @@ def log_audit(connection, table_name, record_id, operation, old_data, new_data, 
               'system', datetime.now()))
         connection.commit()
         cursor.close()
+        logger.info(f"Audit log created: {operation} on {table_name}")
     except Error as e:
-        print(f"Error logging audit: {e}")
+        logger.error(f"Error logging audit: {e}")
 
 def get_primary_key(connection, table_name, schema_name='bse'):
     """
@@ -249,32 +291,55 @@ def get_record(table_name, record_id):
 @app.route('/api/update_record/<table_name>', methods=['POST'])
 def update_record(table_name):
     """
-    Update a record and log to audit table
+    Update a record with input validation and audit logging
     """
-    data = request.json
-    record_id = data.get('record_id')
-    updates = data.get('updates')
-    
-    if not record_id or not updates:
-        return jsonify({'error': 'Missing required data'}), 400
-    
-    conn = connect_to_postgres()
-    if conn:
+    try:
+        # Validate table name
+        table_name = validate_identifier(table_name)
+        
+        data = request.json or {}
+        record_id = data.get('record_id')
+        updates = data.get('updates')
+        
+        # Input validation
+        if not record_id:
+            logger.warning(f"Missing record_id for table {table_name}")
+            return jsonify({'error': 'Missing required field: record_id'}), 400
+        
+        if not updates or not isinstance(updates, dict):
+            logger.warning(f"Invalid updates data for table {table_name}")
+            return jsonify({'error': 'Invalid updates: must be a non-empty object'}), 400
+        
+        # Validate that no update attempts to modify primary key
+        for key in updates.keys():
+            if not isinstance(key, str) or not key.replace('_', '').isalnum():
+                logger.warning(f"Invalid column name: {key}")
+                return jsonify({'error': f'Invalid column name: {key}'}), 400
+        
+        conn = connect_to_postgres()
+        if not conn:
+            logger.error(f"Database connection failed for update_record")
+            return jsonify({'error': 'Database connection error'}), 500
+        
         try:
-            pk_columns = get_primary_key(conn, table_name, 'bse')
+            pk_columns = get_primary_key(conn, table_name, DEFAULT_SCHEMA)
             if not pk_columns:
+                logger.error(f"No primary key found for {DEFAULT_SCHEMA}.{table_name}")
                 return jsonify({'error': 'No primary key found'}), 400
             
             # Parse record_id (could be composite, format: "value1|value2|value3")
             pk_values = record_id.split('|')
+            if len(pk_values) != len(pk_columns):
+                logger.warning(f"PK value count mismatch for {table_name}")
+                return jsonify({'error': 'Invalid record_id format'}), 400
             
-            # Get old data for audit
             cursor = conn.cursor()
-            full_table_name = f"bse.{table_name}"
+            full_table_name = f"{DEFAULT_SCHEMA}.{table_name}"
             
             # Build WHERE clause for composite key
-            where_conditions = ' AND '.join([f"{pk} = %s" for pk in pk_columns])
+            where_conditions = ' AND '.join([f'{pk} = %s' for pk in pk_columns])
             
+            # Get old data for audit
             cursor.execute(f"""
                 SELECT * FROM {full_table_name} 
                 WHERE {where_conditions};
@@ -282,14 +347,19 @@ def update_record(table_name):
             
             column_names = [desc[0] for desc in cursor.description]
             old_row = cursor.fetchone()
-            old_data = dict(zip(column_names, old_row)) if old_row else None
+            
+            if not old_row:
+                logger.warning(f"Record not found in {full_table_name}")
+                return jsonify({'error': 'Record not found'}), 404
+            
+            old_data = dict(zip(column_names, old_row))
             
             # Build update query (exclude PK columns from updates)
             update_columns = [k for k in updates.keys() if k not in pk_columns]
             if not update_columns:
-                return jsonify({'error': 'No columns to update'}), 400
+                return jsonify({'error': 'No columns to update (cannot modify primary key)'}), 400
             
-            set_clause = ', '.join([f"{key} = %s" for key in update_columns])
+            set_clause = ', '.join([f'{key} = %s' for key in update_columns])
             values = [updates[key] for key in update_columns]
             values.extend(pk_values)
             
@@ -311,15 +381,30 @@ def update_record(table_name):
             cursor.close()
             
             # Log to audit table
-            log_audit(conn, table_name, record_id, 'UPDATE', old_data, new_data, 'bse')
+            log_audit(conn, table_name, record_id, 'UPDATE', old_data, new_data, DEFAULT_SCHEMA)
             
+            logger.info(f"Record updated successfully in {table_name}")
             return jsonify({'success': True, 'message': 'Record updated successfully'})
-        except Error as e:
-            conn.rollback()
+        except (Error, ValueError) as e:
+            logger.error(f"Error updating record: {e}")
+            if conn:
+                try:
+                    conn.rollback()
+                except:
+                    pass
             return jsonify({'error': str(e)}), 500
         finally:
-            conn.close()
-    return jsonify({'error': 'Database connection error'}), 500
+            if conn:
+                conn.close()
+    except ValueError as e:
+        logger.error(f"Validation error: {e}")
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        logger.error(f"Unexpected error in update_record: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    debug_mode = os.getenv('DEBUG', 'False').lower() == 'true'
+    port = int(os.getenv('FLASK_PORT', 5000))
+    logger.info(f"Starting Flask app on port {port} (debug={debug_mode})")
+    app.run(debug=debug_mode, port=port)

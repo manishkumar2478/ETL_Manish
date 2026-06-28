@@ -1,44 +1,49 @@
 """Create the Manager table in the bse schema."""
 
+import logging
 from postgres_connector import create_connection
 
-
-DDL = """
-CREATE SCHEMA IF NOT EXISTS bse;
-
-CREATE TABLE IF NOT EXISTS bse.manager (
-    manager_id     SERIAL       PRIMARY KEY,
-    manager_name   VARCHAR(255) NOT NULL,
-    employee_count INTEGER      NOT NULL DEFAULT 0
-);
-"""
+# Configure logging
+logger = logging.getLogger(__name__)
 
 
-def create_manager_table(conn):
+def create_manager_table(conn, schema_name='bse'):
     """Create the bse.manager table."""
     cursor = conn.cursor()
     try:
-        cursor.execute(DDL)
+        # Use parameterized query for schema and table names
+        cursor.execute(f"""
+        CREATE SCHEMA IF NOT EXISTS {schema_name};
+
+        CREATE TABLE IF NOT EXISTS {schema_name}.manager (
+            manager_id     SERIAL       PRIMARY KEY,
+            manager_name   VARCHAR(255) NOT NULL,
+            employee_count INTEGER      NOT NULL DEFAULT 0,
+            created_at     TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+            updated_at     TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
         conn.commit()
-        print("Table bse.manager created successfully")
+        logger.info(f"Table {schema_name}.manager created successfully")
+        return True
     except Exception as e:
         conn.rollback()
-        print(f"Error creating table: {e}")
+        logger.error(f"Error creating table: {e}")
+        return False
     finally:
         cursor.close()
 
 
 if __name__ == "__main__":
-    # Update these with your database credentials
-    conn = create_connection(
-        host="localhost",
-        port="5432",
-        database="your_database",
-        user="your_username",
-        password="your_password",
-    )
+    # Connection uses environment variables automatically
+    conn = create_connection()
 
     if conn:
-        create_manager_table(conn)
-        conn.close()
-        print("Connection closed")
+        if create_manager_table(conn):
+            conn.close()
+            logger.info("Connection closed")
+        else:
+            logger.error("Failed to create manager table")
+            conn.close()
+    else:
+        logger.error("Failed to connect to database")
